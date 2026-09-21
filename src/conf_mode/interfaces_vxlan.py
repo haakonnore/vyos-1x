@@ -21,6 +21,7 @@ from vyos.config import Config
 from vyos.configdep import set_dependents
 from vyos.configdep import call_dependents
 from vyos.configdict import get_interface_dict
+from vyos.configdict import get_vxlan_gbp_config
 from vyos.configdict import leaf_node_changed
 from vyos.configdict import is_node_changed
 from vyos.configdict import is_vrf_changed
@@ -32,6 +33,7 @@ from vyos.configverify import verify_mirror_redirect
 from vyos.configverify import verify_source_interface
 from vyos.configverify import verify_bond_bridge_member
 from vyos.configverify import verify_vrf
+from vyos.configverify import verify_vxlan_gbp
 from vyos.ifconfig import Interface
 from vyos.ifconfig import VXLANIf
 from vyos.template import is_ipv6
@@ -83,10 +85,10 @@ def get_config(config=None):
 
     # We need to verify that no other VXLAN tunnel is configured when external
     # mode is in use - Linux Kernel limitation
-    conf.set_level(base)
-    vxlan['other_tunnels'] = conf.get_config_dict([], key_mangling=('-', '_'),
-                                                  get_first_key=True,
-                                                  no_tag_node_value_mangle=True)
+    vxlan['other_tunnels'] = get_vxlan_gbp_config(conf)
+    vxlan['underlay_vrf'] = (
+        vxlan['other_tunnels'].get(ifname, {}).get('underlay_vrf', '')
+    )
 
     # This if-clause is just to be sure - it will always evaluate to true
     ifname = vxlan['ifname']
@@ -104,26 +106,6 @@ def get_config(config=None):
         set_dependents('firewall', conf)
 
     return vxlan
-
-
-def vxlan_socket_families(config):
-    # External mode opens both IPv4 and IPv6 sockets.
-    if dict_search('parameters.external', config) is not None:
-        return {4, 6}
-    addresses = [config.get('source_address', ''), config.get('group', '')]
-    addresses.extend(config.get('remote', []))
-    if any(is_ipv6(address) for address in addresses if address):
-        return {6}
-    return {4}
-
-
-def vxlan_underlay_vrf(config):
-    # The socket binds to the source interface's VRF, not the overlay VRF.
-    # A source interface that does not exist yet cannot bind the socket.
-    source = config.get('source_interface')
-    if source and interface_exists(source):
-        return Interface(source).get_vrf() or ''
-    return ''
 
 
 def verify(vxlan):
@@ -183,27 +165,9 @@ def verify(vxlan):
             'received group policy ID.'
         )
 
-    # Different GBP flags cannot share a socket. Separate address families or
-    # underlay VRFs can reuse a UDP port without sharing that socket.
-    families = vxlan_socket_families(vxlan)
-    for tunnel, tunnel_config in vxlan.get('other_tunnels', {}).items():
-        if ('gbp' in tunnel_config) == ('gbp' in vxlan):
-            continue
-        # other_tunnels carries no defaults; 4789 is the XML defaultValue.
-        if tunnel_config.get('port', '4789') != vxlan['port']:
-            continue
-        if not families & vxlan_socket_families(tunnel_config):
-            continue
-        vrf = vxlan_underlay_vrf(vxlan)
-        other_vrf = vxlan_underlay_vrf(tunnel_config)
-        # An unbound socket also conflicts with sockets bound to a VRF.
-        if vrf and other_vrf and vrf != other_vrf:
-            continue
-        raise ConfigError(
-            f'VXLAN interface "{tunnel}" shares UDP port '
-            f'{vxlan["port"]} but has a different "gbp" setting; '
-            'use matching GBP settings or a different UDP port.'
-        )
+    verify_vxlan_gbp(
+        {vxlan['ifname']: vxlan, **vxlan.get('other_tunnels', {})}, vxlan['ifname']
+    )
 
     if 'gpe' in vxlan and dict_search('parameters.external', vxlan) is None:
         raise ConfigError(

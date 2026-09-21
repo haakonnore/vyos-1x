@@ -460,6 +460,62 @@ def get_pppoe_interfaces(conf, vrf=None):
 
     return pppoe_interfaces
 
+def get_vxlan_gbp_config(config):
+    """
+    Return VXLAN tunnels with their candidate underlay VRF bindings.
+
+    Only tunnels with a different GBP setting can conflict. While GBP is unused
+    or set on every tunnel the bindings are left empty, so the common interface
+    path does not read the complete interfaces tree for nothing.
+    """
+    from vyos.ifconfig import Interface
+    from vyos.utils.network import interface_exists
+
+    def get_dict(path):
+        return config.get_config_dict(
+            path,
+            key_mangling=('-', '_'),
+            get_first_key=True,
+            no_tag_node_value_mangle=True,
+        )
+
+    level = config.get_level()
+    config.set_level([])
+    try:
+        tunnels = get_dict(['interfaces', 'vxlan'])
+        mixed = len({'gbp' in tunnel for tunnel in tunnels.values()}) > 1
+        interfaces = get_dict(['interfaces']) if mixed else {}
+    finally:
+        config.set_level(level)
+
+    vrfs = {}
+
+    def add_interface(name, interface):
+        vrfs[name] = interface.get('vrf', '')
+        for kind in ['vif', 'vif_s', 'vif_c']:
+            for vlan, vlan_config in interface.get(kind, {}).items():
+                add_interface(f'{name}.{vlan}', vlan_config)
+
+    for kind, section in interfaces.items():
+        # VPP interfaces nest one level deeper and have no "vrf" CLI node.
+        if kind == 'vpp':
+            continue
+        for name, interface in section.items():
+            add_interface(name, interface)
+
+    for tunnel in tunnels.values():
+        source = tunnel.get('source_interface')
+        vrf = vrfs.get(source, '')
+        # Preserve support for source interfaces managed outside interfaces,
+        # e.g. container networks. Those use the running binding, and a VRF
+        # change on them is not revalidated.
+        if mixed and source and source not in vrfs and interface_exists(source):
+            vrf = Interface(source).get_vrf() or ''
+        tunnel['underlay_vrf'] = vrf
+
+    return tunnels
+
+
 def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pki=False):
     """
     Common utility function to retrieve and mangle the interfaces configuration
@@ -656,6 +712,12 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
     )
     if any(key == ifname or key.startswith(f'{ifname}.') for key in static_arp.keys()):
         dict.update({'static_arp': {}})
+
+    # Validate before applying an underlay VRF change. A dependent invoked
+    # after apply() would reject the commit only after moving the interface.
+    # is_vrf_changed() also covers vif and vif-s/vif-c on this interface.
+    if config.exists(['interfaces', 'vxlan']) and is_vrf_changed(config, ifname):
+        dict['vxlan_gbp_tunnels'] = get_vxlan_gbp_config(config)
 
     return ifname, dict
 

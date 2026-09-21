@@ -99,11 +99,58 @@ def verify_mtu_ipv6(config):
             tmp = dict_search('ipv6.address.interface_identifier', config)
             if tmp != None: raise ConfigError(error_msg)
 
+def verify_vxlan_gbp(tunnels, ifname=None):
+    """Reject incompatible GBP settings on overlapping receive sockets."""
+    from itertools import combinations
+    from vyos.template import is_ipv6
+
+    def socket_families(tunnel):
+        if dict_search('parameters.external', tunnel) is not None:
+            return {4, 6}
+        addresses = [tunnel.get('source_address', ''), tunnel.get('group', '')]
+        addresses.extend(tunnel.get('remote', []))
+        return {6} if any(is_ipv6(a) for a in addresses if a) else {4}
+
+    # Only tunnels with a different GBP setting can conflict.
+    if len({'gbp' in tunnel for tunnel in tunnels.values()}) < 2:
+        return
+
+    pairs = combinations(tunnels.items(), 2)
+    if ifname is not None:
+        pairs = (
+            ((ifname, tunnels[ifname]), item)
+            for item in tunnels.items()
+            if item[0] != ifname
+        )
+    for (name, tunnel), (other_name, other) in pairs:
+        if ('gbp' in tunnel) == ('gbp' in other):
+            continue
+        # Tunnels read without defaults still use the XML default port.
+        port = tunnel.get('port', '4789')
+        if port != other.get('port', '4789'):
+            continue
+        if not socket_families(tunnel) & socket_families(other):
+            continue
+        vrf, other_vrf = tunnel['underlay_vrf'], other['underlay_vrf']
+        # An unbound socket also conflicts with sockets bound to a VRF.
+        if vrf and other_vrf and vrf != other_vrf:
+            continue
+        raise ConfigError(
+            f'VXLAN interfaces "{name}" and "{other_name}" share UDP port '
+            f'{port} but have a different "gbp" setting; '
+            'use matching GBP settings, a different UDP port or source '
+            'interfaces in separate VRFs.'
+        )
+
+
 def verify_vrf(config):
     """
     Common helper function used by interface implementations to perform
     recurring validation of VRF configuration.
     """
+    if 'vxlan_gbp_tunnels' in config:
+        verify_vxlan_gbp(config['vxlan_gbp_tunnels'])
+
     if 'vrf' in config:
         vrfs = config['vrf']
         if isinstance(vrfs, str):

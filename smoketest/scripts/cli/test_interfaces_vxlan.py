@@ -236,11 +236,98 @@ class VXLANInterfaceTest(BasicInterfaceTest.TestCase):
         self.assertEqual(options['ifindex'], current['ifindex'])
         self.assertEqual(options['linkinfo'], current['linkinfo'])
 
+        self.cli_delete(self._base_path)
+        self.cli_commit()
         for source in vrfs:
             self.cli_delete(['interfaces', 'ethernet', source, 'vrf'])
         for vrf in vrfs.values():
             self.cli_delete(['vrf', 'name', vrf])
         self.cli_commit()
+
+    def _test_vxlan_gbp_underlay_vrf_change(self, sources):
+        # The only candidate change in each rejection case is the underlay
+        # VRF. VXLAN's own conf-mode script would not normally be invoked.
+        tunnels = ['vxlan10', 'vxlan20']
+        vrfs = ['red', 'blue', 'green']
+        try:
+            for table, vrf in enumerate(vrfs, 65010):
+                self.cli_set(['vrf', 'name', vrf, 'table', str(table)])
+            for index, (source, path) in enumerate(sources):
+                self.cli_set(path + ['vrf', vrfs[index]])
+                tunnel = self._base_path + [tunnels[index]]
+                self.cli_set(tunnel + ['vni', str(index + 10)])
+                self.cli_set(tunnel + ['remote', '127.0.0.2'])
+                self.cli_set(tunnel + ['source-interface', source])
+                self.cli_set(tunnel + ['mtu', '1400'])
+            self.cli_set(self._base_path + [tunnels[0], 'gbp'])
+            self.cli_commit()
+            before = {name: get_interface_config(name) for name in tunnels}
+
+            source, path = sources[1]
+            for target in ['red', None]:
+                with self.subTest(target_vrf=target):
+                    if target is None:
+                        self.cli_delete(path + ['vrf'])
+                    else:
+                        self.cli_set(path + ['vrf', target])
+                    with self.assertRaisesRegex(
+                        ConfigSessionError, r'different "gbp"\s+setting'
+                    ):
+                        self.cli_commit()
+                    # Check before discard: rejection must not move the source
+                    # or recreate either of the working VXLAN interfaces.
+                    self.assertEqual('blue', Interface(source).get_vrf())
+                    for name in tunnels:
+                        current = get_interface_config(name)
+                        self.assertEqual(before[name]['ifindex'], current['ifindex'])
+                        self.assertEqual(before[name]['linkinfo'], current['linkinfo'])
+                        self.assertEqual('up', Interface(name).get_admin_state())
+                    self.cli_discard()
+
+            # Moving to another distinct VRF is valid. Reopening the tunnel
+            # also checks that its socket can bind to the resulting VRF.
+            self.cli_set(path + ['vrf', 'green'])
+            self.cli_commit()
+            self.assertEqual('green', Interface(source).get_vrf())
+            interface = Interface(tunnels[1])
+            interface.set_admin_state('down')
+            interface.set_admin_state('up')
+            self.assertEqual('up', interface.get_admin_state())
+        finally:
+            self.cli_discard()
+            # Release the tunnels before removing their underlay bindings.
+            self.cli_delete(self._base_path)
+            self.cli_commit()
+            for _, path in sources:
+                # Keep the Ethernet interface, but remove a complete VLAN.
+                self.cli_delete(path[:5] if len(path) > 3 else path + ['vrf'])
+            for vrf in vrfs:
+                self.cli_delete(['vrf', 'name', vrf])
+            self.cli_commit()
+
+    def test_vxlan_gbp_underlay_ethernet_vrf_change(self):
+        self._test_vxlan_gbp_underlay_vrf_change(
+            [
+                ('eth1', ['interfaces', 'ethernet', 'eth1']),
+                ('eth2', ['interfaces', 'ethernet', 'eth2']),
+            ]
+        )
+
+    def test_vxlan_gbp_underlay_qinq_vrf_change(self):
+        # The deepest VLAN nesting; vif and vif-s resolve through the same
+        # code and are covered by src/tests/test_vxlan_gbp.py.
+        self._test_vxlan_gbp_underlay_vrf_change(
+            [
+                (
+                    'eth1.200.100',
+                    ['interfaces', 'ethernet', 'eth1', 'vif-s', '200', 'vif-c', '100'],
+                ),
+                (
+                    'eth2.200.100',
+                    ['interfaces', 'ethernet', 'eth2', 'vif-s', '200', 'vif-c', '100'],
+                ),
+            ]
+        )
 
     def test_vxlan_gbp_separate_address_families(self):
         for interface, remote in [('vxlan10', '127.0.0.2'), ('vxlan20', '::1')]:
